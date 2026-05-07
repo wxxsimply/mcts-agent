@@ -2,6 +2,7 @@ package mcts
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 )
@@ -9,16 +10,15 @@ import (
 // Node 代表大模型推理过程中的一个状态节点
 type Node struct {
 	Thought  string  // 当前步骤的文本描述
-	TaskType string  // "math" 或 "code"
 	Parent   *Node   // 父节点指针
 	Children []*Node // 子节点切片
 
-	// MCTS 统计数据 (使用原子操作或锁保护)
+	// MCTS 统计数据
 	Visits      float64
 	Value       float64
 	VirtualLoss int32 // 正在进行的并发探索数 (用于 UCB 惩罚)
 
-	Mu sync.RWMutex // 读写锁：保护 Children 的并发读写
+	Mu sync.RWMutex
 }
 
 // NewRootNode 初始化思维树的根节点
@@ -41,7 +41,7 @@ func (n *Node) AddChild(thought string) *Node {
 	return child
 }
 
-// GetPath 溯源：从根到当前节点的完整思维路径（用于生成 Prompt）
+// GetPath 溯源：从根到当前节点的完整思维路径
 func (n *Node) GetPath() string {
 	var path []string
 	curr := n
@@ -58,30 +58,46 @@ func (n *Node) PrintTree(depth int) {
 	defer n.Mu.RUnlock()
 
 	indent := strings.Repeat("  ", depth)
-	fmt.Printf("%s|-- [%.1f/%.0f] %s\n", indent, n.Value, n.Visits, n.Thought)
+	avg := 0.0
+	if n.Visits > 0 {
+		avg = n.Value / n.Visits
+	}
+	fmt.Printf("%s|-- [avg=%.2f val=%.1f visits=%.0f] %s\n",
+		indent, avg, n.Value, n.Visits, truncate(n.Thought, 50))
 	for _, child := range n.Children {
 		child.PrintTree(depth + 1)
 	}
 }
 
-// node.go
+// GetBestCode 按平均分（而非累计分）贪心选择最优路径
 func (n *Node) GetBestCode() string {
 	n.Mu.RLock()
 	defer n.Mu.RUnlock()
 
-	// 寻找 Value 最高的子节点
 	var bestChild *Node
-	maxVal := -1.0
+	bestAvg := -1.0
 	for _, child := range n.Children {
-		if child != nil && child.Value > maxVal { // 增加 child != nil 检查
-			maxVal = child.Value
+		if child == nil {
+			continue
+		}
+		avg := child.Value / math.Max(1.0, child.Visits)
+		if avg > bestAvg {
+			bestAvg = avg
 			bestChild = child
 		}
 	}
 
-	// 只有找到了有效的 bestChild 才递归
 	if bestChild != nil {
 		return bestChild.GetBestCode()
 	}
 	return n.Thought
+}
+
+// truncate 截断字符串用于日志展示
+func truncate(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "..."
 }

@@ -1,44 +1,81 @@
 package mcts
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
-	"mcts-agent/llm" // 注意替换为你真实的工程 module 名
+	"mcts-agent/llm"
 	"mcts-agent/runner"
 	"strings"
 	"sync"
 	"sync/atomic"
 )
 
-// ---------------- 结构化输出协议 ----------------
+// ------------- 默认配置常量 -------------
+
+const (
+	DefaultExploreC   = 1.414 // sqrt(2)
+	DefaultMaxDepth   = 4
+	UnvisitedPriority = 10000.0
+	ExpandPenalty     = -0.5
+)
+
+// ------------- 结构化输出协议 -------------
 
 type ExpandResponse struct {
 	Actions []string `json:"actions"`
 }
 
-type EvaluateResponse struct {
-	Score float64 `json:"score"`
+// TestCase 定义评测用例
+type TestCase struct {
+	Input  string // 标准输入（为空表示无需输入）
+	Output string // 期望的标准输出
 }
 
-// ---------------- MCTS 引擎定义 ----------------
+// ------------- MCTS 引擎定义 -------------
 
 type MCTSEngine struct {
 	llmClient *llm.LLMClient
 	exploreC  float64
 	maxDepth  int
+	testCases []TestCase
+
+	// 去重：记录所有已生成的代码
+	generatedMu  sync.Mutex
+	generatedSet map[string]bool
 }
 
 func NewMCTSEngine(client *llm.LLMClient) *MCTSEngine {
 	return &MCTSEngine{
 		llmClient: client,
-		exploreC:  math.Sqrt(2), // 经典探索常数
-		maxDepth:  4,
+		exploreC:  DefaultExploreC,
+		maxDepth:  DefaultMaxDepth,
 	}
-
 }
 
-// Select: 寻找 UCB 最大的叶子节点
+// WithTestCases 设置评测用例
+func (e *MCTSEngine) WithTestCases(tcs []TestCase) *MCTSEngine {
+	e.testCases = tcs
+	return e
+}
+
+// WithExploreC 设置探索常数
+func (e *MCTSEngine) WithExploreC(c float64) *MCTSEngine {
+	e.exploreC = c
+	return e
+}
+
+// WithMaxDepth 设置最大搜索深度
+func (e *MCTSEngine) WithMaxDepth(d int) *MCTSEngine {
+	e.maxDepth = d
+	return e
+}
+
+// ------------- 核心 MCTS 方法 -------------
+
+// selectNode: 选择 UCB 最大的子节点
 func (e *MCTSEngine) selectNode(node *Node) *Node {
 	node.Mu.RLock()
 	defer node.Mu.RUnlock()
@@ -51,9 +88,8 @@ func (e *MCTSEngine) selectNode(node *Node) *Node {
 		var ucb float64
 
 		if child.Visits == 0 {
-			ucb = 10000.0 + vLoss // 尚未访问的节点赋予极高优先级
+			ucb = UnvisitedPriority + vLoss
 		} else {
-			// UCB 公式结合 Virtual Loss 惩罚
 			exploitation := child.Value / child.Visits
 			exploration := e.exploreC * math.Sqrt(math.Log(node.Visits)/(child.Visits+vLoss))
 			ucb = exploitation + exploration
@@ -67,54 +103,124 @@ func (e *MCTSEngine) selectNode(node *Node) *Node {
 	return bestNode
 }
 
-// Expand: 调用 LLM 生成下一步动作
-func (e *MCTSEngine) expand(node *Node) error {
-	fmt.Printf("[LLM] 正在扩展节点: %s...\n", node.Thought) // 加个日志
-	// search.go 中的 expand 函数
-	sysPrompt := `你是一个 acm c++算法竞赛专家。请针对任务提供一种实现，要求：
-	1.如果题目给出了代码，请寻找代码的规律并以此写出代码
-	2.代码能通过洛谷官网的的所有测试点
-	3.代码运用到题目给的所有信息
-	4.时间复杂度控制在题目要求以内。
-	5.代码控制在30行以内
-	请直接返回 JSON 格式: {"actions": ["完整的Go代码"]}，不要重复之前生成过的代码。`
-	userPrompt := fmt.Sprintf("当前状态路径:\n%s\n请给出下一步动作。", node.GetPath())
+// buildExpandPrompt: 组装通用化的扩展提示
+func (e *MCTSEngine) buildExpandPrompt(pathThought string, previousCount int) (string, string) {
+	sysPrompt := `You are an expert algorithm engineer. Generate correct, efficient, and well-structured Go solutions.
 
-	resp, err := e.llmClient.Ask(sysPrompt, userPrompt)
+Requirements:
+1. The code must compile and run correctly
+2. Handle edge cases properly
+3. Optimize time and space complexity within reasonable limits
+4. Write clean, readable Go code
+
+Return strictly as JSON: {"actions": ["complete Go code"]}
+Each action is a complete, independent solution. Generate diverse approaches or algorithmic variations when possible.
+Do NOT generate duplicate or near-duplicate code.`
+
+	userPrompt := fmt.Sprintf("Task:\n%s\n\n(Already generated %d unique solutions — please generate new variations.)",
+		pathThought, previousCount)
+	return sysPrompt, userPrompt
+}
+
+// expand: 调用 LLM 生成子节点（带去重）
+func (e *MCTSEngine) expand(node *Node) error {
+	log.Printf("[LLM] Expanding node: %s...", truncate(node.Thought, 80))
+
+	e.generatedMu.Lock()
+	prevCount := len(e.generatedSet)
+	e.generatedMu.Unlock()
+
+	sysPrompt, userPrompt := e.buildExpandPrompt(node.GetPath(), prevCount)
+
+	resp, err := e.llmClient.Ask(context.Background(), sysPrompt, userPrompt)
 	if err != nil {
-		return err
+		return fmt.Errorf("LLM expand failed: %v", err)
 	}
 
 	var expResp ExpandResponse
 	if err := json.Unmarshal([]byte(e.cleanJSON(resp)), &expResp); err != nil {
-		return err
+		return fmt.Errorf("JSON parse failed: %v\nraw: %s", err, resp)
 	}
 
+	e.generatedMu.Lock()
+	added := 0
 	for _, action := range expResp.Actions {
-		node.AddChild(action)
+		trimmed := strings.TrimSpace(action)
+		if trimmed == "" {
+			continue
+		}
+		if !e.generatedSet[trimmed] {
+			e.generatedSet[trimmed] = true
+			node.AddChild(trimmed)
+			added++
+		}
 	}
+	e.generatedMu.Unlock()
+
+	log.Printf("[LLM] Generated %d actions, %d new after dedup", len(expResp.Actions), added)
 	return nil
 }
 
-func (e *MCTSEngine) evaluate(node *Node) (float64, error) {
-	res := runner.ExecuteCode(node.Thought, "temp.go")
-	// 增加负分惩罚，迫使模型避开无效路径
-	if res.Err != nil {
-		return -0.5, nil // 从原来的 0.1 改为负分，这样树会彻底放弃这条路
+// evaluate: 执行代码并评分。有测试用例时按测试用例评分，否则按编译/运行结果给基础分。
+func (e *MCTSEngine) evaluate(node *Node) float64 {
+	if len(e.testCases) > 0 {
+		return e.evaluateWithCases(node)
 	}
-	// 基础分 0.5，输出正确关键词再加 0.5
-	score := 0.5
-	if strings.Contains(res.Stdout, "Hello MCTS") {
-		score += 0.5
-	}
-	return score, nil
+	return e.evaluateDefault(node)
 }
 
-// Backpropagate: 回溯更新
+// evaluateWithCases: 按测试用例评分（支持标准输入）
+func (e *MCTSEngine) evaluateWithCases(node *Node) float64 {
+	passed := 0
+	total := len(e.testCases)
+	for _, tc := range e.testCases {
+		var res runner.ExecutionResult
+		if tc.Input != "" {
+			res = runner.ExecuteCodeWithStdin(node.Thought, "temp_solution.go", tc.Input)
+		} else {
+			res = runner.ExecuteCode(node.Thought, "temp_solution.go")
+		}
+
+		if res.Err != nil {
+			log.Printf("[Eval] 用例失败(stderr): %s", res.Stderr)
+			continue
+		}
+
+		got := strings.TrimSpace(res.Stdout)
+		want := strings.TrimSpace(tc.Output)
+		if got == want {
+			passed++
+		} else {
+			log.Printf("[Eval] 输出不匹配:\n  期望: %q\n  实际: %q", want, got)
+		}
+	}
+
+	score := float64(passed) / float64(total)
+	log.Printf("[Eval] 通过 %d/%d 测试用例 (score=%.2f)", passed, total, score)
+	return score
+}
+
+// evaluateDefault: 无测试用例时的默认评分
+func (e *MCTSEngine) evaluateDefault(node *Node) float64 {
+	res := runner.ExecuteCode(node.Thought, "temp_solution.go")
+	if res.Err != nil {
+		log.Printf("[Eval] 执行失败: %s", res.Stderr)
+		return ExpandPenalty
+	}
+
+	output := strings.TrimSpace(res.Stdout)
+	if output == "" {
+		log.Printf("[Eval] 代码运行成功但无输出 (score=0.20)")
+		return 0.2
+	}
+	log.Printf("[Eval] 代码运行成功 (score=0.50)")
+	return 0.5
+}
+
+// backpropagate: 回溯更新路径上所有节点的统计信息
 func (e *MCTSEngine) backpropagate(path []*Node, score float64) {
-	// 4. Backpropagate (修改这里的逻辑)
 	for _, p := range path {
-		if p == nil { // 增加这个防守性编程检查
+		if p == nil {
 			continue
 		}
 		p.Mu.Lock()
@@ -125,51 +231,60 @@ func (e *MCTSEngine) backpropagate(path []*Node, score float64) {
 	}
 }
 
-// RunConcurrent: 并发搜索入口
+// RunConcurrent: 并发 MCTS 搜索入口
 func (e *MCTSEngine) RunConcurrent(initialState string, iters int, workers int) *Node {
 	root := NewRootNode(initialState)
 	var wg sync.WaitGroup
 
-	fmt.Printf("开始并发 MCTS 搜索...\n")
+	e.generatedMu.Lock()
+	e.generatedSet = make(map[string]bool)
+	e.generatedMu.Unlock()
+
+	if len(e.testCases) > 0 {
+		log.Printf("MCTS search: %d iters, %d workers, maxDepth=%d, testCases=%d",
+			iters, workers, e.maxDepth, len(e.testCases))
+	} else {
+		log.Printf("MCTS search: %d iters, %d workers, maxDepth=%d (无测试用例，评分信号弱)",
+			iters, workers, e.maxDepth)
+	}
 
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			for j := 0; j < iters/workers; j++ {
-				// 1. Selection
+				// 1. Selection（含深度约束）
 				curr := root
 				var path []*Node
-				// search.go: 139行左右
+				depth := 0
 				for {
 					path = append(path, curr)
 					atomic.AddInt32(&curr.VirtualLoss, 1)
 
 					curr.Mu.RLock()
-					isLeaf := len(curr.Children) == 0
+					isLeaf := len(curr.Children) == 0 || depth >= e.maxDepth
 					curr.Mu.RUnlock()
 
 					if isLeaf {
 						break
 					}
 
-					next := e.selectNode(curr) // 先获取下一个节点
-					if next == nil {           // 必须检查是否为 nil
-						break // 如果找不到子节点，说明到了叶子节点
+					next := e.selectNode(curr)
+					if next == nil {
+						break
 					}
 					curr = next
+					depth++
 				}
 
-				// 2. Expand
-				curr.Mu.Lock()
+				// 2. Expand（仅对无子节点的节点扩展）
+				curr.Mu.RLock()
 				shouldExpand := len(curr.Children) == 0
-				curr.Mu.Unlock()
+				curr.Mu.RUnlock()
 
 				if shouldExpand {
-					err := e.expand(curr) // 此时的 curr 已经是叶子节点
-					if err != nil {
-						fmt.Printf("[Worker %d] Expand 失败: %v\n", workerID, err)
-						// 发生错误时必须清理路径上的 VirtualLoss
+					if err := e.expand(curr); err != nil {
+						log.Printf("[Worker %d] Expand: %v", workerID, err)
 						for _, p := range path {
 							atomic.AddInt32(&p.VirtualLoss, -1)
 						}
@@ -177,46 +292,67 @@ func (e *MCTSEngine) RunConcurrent(initialState string, iters int, workers int) 
 					}
 				}
 
-				// 3. Evaluate (必须在扩展后执行)
-				// 如果刚刚扩展了，从子节点选一个评估；如果没扩展，直接评估当前
+				// 3. Evaluate — 评估选定节点自身的代码（而非它的子节点）
+				//    根节点不含可执行代码，特殊处理为其第一个子节点
 				evalTarget := curr
-				curr.Mu.RLock()
-				if len(curr.Children) > 0 {
-					evalTarget = curr.Children[0]
+				if curr == root {
+					curr.Mu.RLock()
+					if len(curr.Children) > 0 {
+						evalTarget = curr.Children[0]
+					}
+					curr.Mu.RUnlock()
 				}
-				curr.Mu.RUnlock()
 
-				// 关键改动：添加 nil 检查
 				if evalTarget == nil {
 					continue
 				}
 
-				score, _ := e.evaluate(evalTarget)
-				// 在 RunConcurrent 的循环末尾调用 backpropagate 前：
-				if len(path) > 0 {
-					e.backpropagate(path, score)
-				}
-				// 4. Backpropagate (更新所有路径节点)
-				// 注意：如果选了子节点评估，需要把子节点也加进路径
+				score := e.evaluate(evalTarget)
+
+				// 4. Backpropagate（单次回传）
 				if evalTarget != curr {
+					atomic.AddInt32(&evalTarget.VirtualLoss, 1)
 					path = append(path, evalTarget)
 				}
 				e.backpropagate(path, score)
 
-				fmt.Printf("[Worker %d] 迭代 %d 完成\n", workerID, j)
+				log.Printf("[Worker %d] Iter %d done (depth=%d, score=%.2f)", workerID, j, depth, score)
 			}
 		}(i)
 	}
 	wg.Wait()
-	fmt.Println("\n--- 最终搜索树结果 ---")
+
+	log.Printf("Search complete. Unique solutions generated: %d", func() int {
+		e.generatedMu.Lock()
+		defer e.generatedMu.Unlock()
+		return len(e.generatedSet)
+	}())
+	root.PrintTree(0)
 	return root
 }
 
-// cleanJSON 处理 LLM 返回的 Markdown 代码块污染
+// cleanJSON: 健壮地提取最外层 JSON（处理嵌套花括号）
 func (e *MCTSEngine) cleanJSON(input string) string {
 	start := strings.Index(input, "{")
-	end := strings.LastIndex(input, "}")
-	if start == -1 || end == -1 {
+	if start == -1 {
+		return input
+	}
+
+	depth := 0
+	end := -1
+	for i := start; i < len(input); i++ {
+		switch input[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end = i
+				break
+			}
+		}
+	}
+	if end == -1 {
 		return input
 	}
 	return input[start : end+1]
