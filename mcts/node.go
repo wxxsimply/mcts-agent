@@ -18,6 +18,8 @@ type Node struct {
 	Value       float64
 	VirtualLoss int32 // 正在进行的并发探索数 (用于 UCB 惩罚)
 
+	DeadEnd bool // expand 后未产生有效代码时标记，后续迭代跳过此节点
+
 	Mu sync.RWMutex
 }
 
@@ -100,4 +102,31 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen]) + "..."
+}
+
+// NodeInfo 节点的可序列化表示，用于前端展示
+type NodeInfo struct {
+	Thought  string     `json:"thought"`
+	Value    float64    `json:"value"`
+	Visits   float64    `json:"visits"`
+	Avg      float64    `json:"avg"`
+	Children []NodeInfo `json:"children,omitempty"`
+}
+
+// ToInfo 将树转换为可序列化结构
+func (n *Node) ToInfo() NodeInfo {
+	n.Mu.RLock()
+	defer n.Mu.RUnlock()
+	info := NodeInfo{
+		Thought: truncate(n.Thought, 120),
+		Value:   n.Value,
+		Visits:  n.Visits,
+	}
+	if n.Visits > 0 {
+		info.Avg = n.Value / n.Visits
+	}
+	for _, child := range n.Children {
+		info.Children = append(info.Children, child.ToInfo())
+	}
+	return info
 }

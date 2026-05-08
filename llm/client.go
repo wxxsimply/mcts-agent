@@ -62,14 +62,20 @@ func (c *LLMClient) Ask(ctx context.Context, sysPrompt string, userPrompt string
 		Temperature: 0.7,
 	}
 
-	// 简单重试：失败后重试一次
+	// 简单重试：失败后重试一次（监听 ctx.Done() 避免无效等待）
 	for attempt := 0; attempt < 2; attempt++ {
 		resp, err := c.client.CreateChatCompletion(ctx, req)
 		if err == nil {
 			return resp.Choices[0].Message.Content, nil
 		}
+
 		if attempt == 0 {
-			time.Sleep(time.Second)
+			// 如果 context 已取消，直接返回，不 sleep
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("LLM API call cancelled: %v", ctx.Err())
+			case <-time.After(time.Second):
+			}
 		} else {
 			return "", fmt.Errorf("LLM API failed after retry: %v", err)
 		}

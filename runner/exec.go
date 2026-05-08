@@ -3,9 +3,9 @@ package runner
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"time"
 )
 
@@ -16,25 +16,40 @@ type ExecutionResult struct {
 	Err    error
 }
 
-// ExecuteCode 运行一段 Go 代码，带 5 秒超时保护
+// DefaultExecTimeout 默认代码执行超时
+var DefaultExecTimeout = 2 * time.Second
+
+// ExecuteCode 运行一段 Go 代码，带超时保护
 func ExecuteCode(code string, filename string) ExecutionResult {
 	return ExecuteCodeWithStdin(code, filename, "")
 }
 
-// ExecuteCodeWithStdin 运行 Go 代码并传入标准输入，带 5 秒超时保护
+// ExecuteCodeWithStdin 运行 Go 代码并传入标准输入，带超时保护
 func ExecuteCodeWithStdin(code string, filename string, stdin string) ExecutionResult {
+	return ExecuteCodeWithConfig(code, filename, stdin, DefaultExecTimeout)
+}
+
+// ExecuteCodeWithConfig 使用完整配置运行 Go 代码，stdout/stderr 分离
+func ExecuteCodeWithConfig(code string, filename string, stdin string, timeout time.Duration) ExecutionResult {
 	if filename == "" {
-		filename = "temp_solution.go"
+		filename = "temp_solution"
 	}
 
-	filePath := filepath.Join(os.TempDir(), filename)
-
-	if err := os.WriteFile(filePath, []byte(code), 0644); err != nil {
+	// 使用 os.CreateTemp 创建唯一临时文件，避免并发 worker 之间的竞态
+	f, err := os.CreateTemp(os.TempDir(), fmt.Sprintf("%s_*.go", filename))
+	if err != nil {
+		return ExecutionResult{Stderr: "create temp file failed", Err: err}
+	}
+	filePath := f.Name()
+	if _, err := f.Write([]byte(code)); err != nil {
+		f.Close()
+		os.Remove(filePath)
 		return ExecutionResult{Stderr: "write file failed", Err: err}
 	}
+	f.Close()
 	defer os.Remove(filePath)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "go", "run", filePath)
@@ -44,19 +59,22 @@ func ExecuteCodeWithStdin(code string, filename string, stdin string) ExecutionR
 		cmd.Stdin = bytes.NewBufferString(stdin)
 	}
 
-	output, err := cmd.CombinedOutput()
+	// 分离 stdout 和 stderr，避免测试用例比较时因 stderr 内容导致误判
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	err = cmd.Run()
 
 	result := ExecutionResult{
-		Stdout: string(output),
-		Stderr: "",
+		Stdout: stdoutBuf.String(),
+		Stderr: stderrBuf.String(),
 		Err:    err,
 	}
 
 	if err != nil {
 		if ctx.Err() != nil {
-			result.Stderr = "execution timed out (5s)"
-		} else {
-			result.Stderr = string(output)
+			result.Stderr = fmt.Sprintf("execution timed out (%v)\n%s", timeout, stderrBuf.String())
 		}
 	}
 

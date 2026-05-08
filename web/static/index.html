@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MCTS Agent — 深度推理搜索</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --orange: #d29922;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  .app { display: none; flex-direction: column; height: 100vh; }
+  .app.show { display: flex; }
+  header { padding: 16px 24px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 18px; font-weight: 600; }
+  header .badge { font-size: 11px; background: #1f6feb33; color: var(--accent); padding: 2px 8px; border-radius: 10px; border: 1px solid #1f6feb55; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); margin-left: auto; }
+  .status-dot.running { background: var(--green); animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{ opacity:1; } 50%{ opacity:0.4; } }
+  .toolbar { padding: 12px 24px; display: flex; gap: 8px; background: var(--surface); border-bottom: 1px solid var(--border); }
+  .layout { display: grid; grid-template-columns: 260px 1fr 1fr; flex: 1; overflow: hidden; }
+  .sidebar, .panel { display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--border); }
+  .sidebar { background: #0b1220; }
+  .panel:last-child { border-right: none; }
+  .panel-header { padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .panel-header .count { font-size: 11px; color: var(--dim); font-weight: 400; margin-left: auto; }
+  .panel-body { flex: 1; overflow: auto; padding: 12px; }
+  .input-section { padding: 16px 24px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .input-section textarea, .field { flex: 1; min-width: 220px; background: #010409; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; font-size: 14px; }
+  .input-section textarea { min-width: 300px; min-height: 44px; max-height: 80px; resize: vertical; font-family: inherit; }
+  .input-section textarea:focus, .field:focus { outline: none; border-color: var(--accent); }
+  .input-section .actions, .login-actions { display: flex; gap: 8px; align-items: center; }
+  .btn { padding: 8px 20px; border-radius: 6px; border: 1px solid var(--border); font-size: 14px; font-weight: 500; cursor: pointer; transition: all .15s; background: #21262d; color: var(--text); white-space: nowrap; }
+  .btn:hover { background: #30363d; }
+  .btn-primary { background: #238636; border-color: #2ea043; color: #fff; }
+  .btn-primary:hover { background: #2ea043; }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-secondary { background: #21262d; }
+  .btn-link { background: transparent; }
+  .history-list { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .history-item { text-align: left; width: 100%; border: 1px solid var(--border); border-radius: 8px; background: #010409; color: var(--text); padding: 10px 12px; cursor: pointer; }
+  .history-item .time { display: block; color: var(--dim); font-size: 11px; margin-top: 6px; }
+  .history-empty { color: var(--dim); font-size: 13px; padding: 12px; }
+  .main { display: grid; grid-template-columns: 1fr 1fr; flex: 1; overflow: hidden; }
+  @media (max-width: 1000px) { .layout, .main { grid-template-columns: 1fr; } .sidebar { border-right: none; border-bottom: 1px solid var(--border); } }
+  .test-cases { padding: 0 24px 12px; border-bottom: 1px solid var(--border); display: none; }
+  .test-cases.show { display: block; }
+  .test-cases summary { cursor: pointer; color: var(--accent); font-size: 13px; padding: 8px 0; }
+  .tc-row { display: flex; gap: 8px; align-items: center; margin: 6px 0; font-size: 13px; }
+  .tc-row input { background: #010409; color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; font-family: monospace; font-size: 13px; }
+  .tc-row input[type="text"] { flex: 1; }
+  .tc-row .btn-sm { padding: 4px 10px; font-size: 12px; }
+  .tree ul { padding-left: 20px; list-style: none; }
+  .tree > ul { padding-left: 0; }
+  .tree li { position: relative; margin: 2px 0; }
+  .tree .node { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 5px; font-size: 12px; cursor: default; border: 1px solid transparent; transition: all .15s; max-width: 100%; font-family: monospace; }
+  .tree .node .thought { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
+  .tree .node .score { font-weight: 600; font-size: 11px; padding: 1px 6px; border-radius: 3px; flex-shrink: 0; }
+  .tree .node .score.high { background: #3fb95022; color: var(--green); }
+  .tree .node .score.mid  { background: #d2992222; color: var(--orange); }
+  .tree .node .score.low  { background: #f8514922; color: var(--red); }
+  .tree .node.root { border-color: var(--border); background: #1f6feb11; }
+  .tree .node.highlight { border-color: var(--green); background: #3fb95011; }
+  .tree .node .expand-toggle { cursor: pointer; width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; border-radius: 3px; color: var(--dim); font-size: 10px; flex-shrink: 0; }
+  .tree .node .expand-toggle:hover { background: var(--border); }
+  .log-container { font-family: monospace; font-size: 12px; line-height: 1.6; }
+  .log-entry { padding: 2px 0; display: flex; gap: 8px; border-bottom: 1px solid #21262d; }
+  .log-entry .time { color: var(--dim); flex-shrink: 0; }
+  .log-entry .msg { color: var(--text); word-break: break-all; }
+  .log-entry .msg.info { color: var(--accent); }
+  .log-entry .msg.done { color: var(--green); }
+  .log-entry .msg.warn { color: var(--orange); }
+  .log-entry .msg.error { color: var(--red); }
+  .log-entry .msg.score { color: #d2a8ff; }
+  .result-section { display: none; }
+  .result-section.show { display: block; }
+  .result-section pre { background: #010409; border: 1px solid var(--border); border-radius: 6px; padding: 16px; overflow-x: auto; font-size: 13px; line-height: 1.5; font-family: 'Cascadia Code', 'Fira Code', monospace; }
+  .result-section .copy-btn { float: right; padding: 4px 12px; font-size: 12px; }
+  .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--dim); font-size: 14px; gap: 8px; }
+  .empty-state .icon { font-size: 32px; opacity: 0.3; }
+  .login { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .login-card { width: min(360px, calc(100vw - 32px)); background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
+  .login-card h1 { font-size: 20px; margin-bottom: 8px; }
+  .login-card p { color: var(--dim); margin-bottom: 16px; font-size: 14px; }
+  .login-card .field { width: 100%; margin-bottom: 10px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="loginView" class="login">
+  <div class="login-card">
+    <h1>MCTS Agent 登录</h1>
+    <p>请输入账号：admin / admin</p>
+    <input id="username" class="field" placeholder="用户名" autocomplete="username">
+    <input id="password" class="field" type="password" placeholder="密码" autocomplete="current-password">
+    <div class="login-actions">
+      <button class="btn btn-primary" onclick="login()">登录</button>
+      <span id="loginMsg" style="color:var(--dim);font-size:13px"></span>
+    </div>
+  </div>
+</div>
+
+<div id="appView" class="app">
+  <header>
+    <h1>🧠 MCTS Agent</h1>
+    <span class="badge">DeepSeek V4 Flash</span>
+    <span class="badge" id="modelBadge">MCTS 搜索</span>
+    <span class="status-dot" id="statusDot"></span>
+    <button class="btn btn-link" style="margin-left:auto" onclick="logout()">退出</button>
+  </header>
+
+  <div class="toolbar">
+    <span class="badge">搜索历史保存在本地</span>
+    <button class="btn btn-secondary" onclick="clearHistory()">清空历史</button>
+  </div>
+
+  <div class="input-section">
+    <textarea id="taskInput" placeholder="输入任务描述，例如：写一个 Go 程序计算斐波那契数列的第 N 项..."></textarea>
+    <div class="actions">
+      <button class="btn btn-secondary" onclick="toggleTestCases()">测试用例</button>
+      <button class="btn btn-primary" id="startBtn" onclick="startSearch()">开始搜索</button>
+    </div>
+  </div>
+
+  <div class="test-cases" id="testCasesSection">
+    <details>
+      <summary>测试用例（可选，用于精确评分）</summary>
+      <div id="tcList"></div>
+      <button class="btn btn-sm" onclick="addTestCase()" style="margin-top:6px">+ 添加用例</button>
+    </details>
+  </div>
+
+  <div class="layout">
+    <div class="sidebar">
+      <div class="panel-header">🕘 搜索历史 <span class="count" id="historyCount"></span></div>
+      <div class="history-list" id="historyList"><div class="history-empty">暂无历史</div></div>
+    </div>
+
+    <div class="main">
+      <div class="panel">
+        <div class="panel-header">🌳 搜索树 <span class="count" id="treeCount"></span></div>
+        <div class="panel-body" id="treePanel"><div class="empty-state"><div class="icon">🌲</div><div>输入任务后点击"开始搜索"</div></div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">📋 推理日志 <span class="count" id="logCount">0</span></div>
+        <div class="panel-body" id="logPanel"><div class="empty-state"><div class="icon">💬</div><div>实时思考过程将在此显示</div></div></div>
+        <div class="result-section" id="resultSection">
+          <div class="panel-header" style="border-top:1px solid var(--border)">💡 最佳方案 <button class="copy-btn btn btn-sm" onclick="copyCode()">复制</button></div>
+          <div class="panel-body"><pre id="codeDisplay"></pre></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let testCases = [];
+let eventSource = null;
+let searching = false;
+let treeRoot = null;
+let logCount = 0;
+let latestTreeChildren = 0;
+const HISTORY_KEY = 'mcts_history';
+
+function toggleTestCases() { document.getElementById('testCasesSection').classList.toggle('show'); }
+function addTestCase(inputVal, outputVal) {
+  const list = document.getElementById('tcList');
+  const i = testCases.length;
+  testCases.push({ input: '', output: '' });
+  const row = document.createElement('div');
+  row.className = 'tc-row';
+  row.innerHTML = `<span style="color:var(--dim);font-size:12px">#${i+1}</span><input type="text" placeholder="输入 (stdin)" value="${inputVal||''}" onchange="testCases[${i}].input=this.value"><input type="text" placeholder="期望输出" value="${outputVal||''}" onchange="testCases[${i}].output=this.value"><button class="btn btn-sm" onclick="this.parentElement.remove();testCases[${i}]=null">✕</button>`;
+  list.appendChild(row);
+}
+function connectSSE() {
+  if (eventSource) eventSource.close();
+  eventSource = new EventSource('/api/events');
+  eventSource.addEventListener('start', e => { const d = JSON.parse(e.data); searching = true; treeRoot = null; latestTreeChildren = 0; updateStatus(true); document.getElementById('startBtn').disabled = true; addLog('info', `搜索已启动：${d.data?.task || ''}`); renderTree(null); });
+  eventSource.addEventListener('expand', e => { const d = JSON.parse(e.data); const data = d.data || {}; latestTreeChildren = data.children ?? latestTreeChildren; addLog('', `[Worker ${data.worker ?? '?'}] 展开节点: ${data.thought || ''} → ${latestTreeChildren} 个子节点`); });
+  eventSource.addEventListener('evaluate', e => { const d = JSON.parse(e.data); const score = d.data?.score ?? 0; const cls = score >= 0.5 ? 'score' : score >= 0 ? 'info' : 'warn'; const label = score >= 0.5 ? '✅' : score >= 0 ? '⚡' : '❌'; addLog(cls, `${label} [Worker ${d.data?.worker ?? '?'}] 评分: ${Number(score).toFixed(2)} — ${d.data?.thought || ''}`); });
+  eventSource.addEventListener('tree', e => { const d = JSON.parse(e.data); const treeData = d.data; if (treeData && treeData.thought !== undefined) { treeRoot = treeData; renderTree(treeRoot); } });
+  eventSource.addEventListener('reasoning', e => { const d = JSON.parse(e.data); const data = d.data || {}; const score = Number(data.score ?? 0); const cls = score >= 0.5 ? 'score' : score >= 0 ? 'info' : 'warn'; addLog(cls, `推理中 [Worker ${data.worker ?? '?'}] ${score.toFixed(2)} — ${data.thought || ''}`); });
+  eventSource.addEventListener('complete', e => { const d = JSON.parse(e.data); const payload = d.data || {}; searchEnded(); addLog('done', `搜索完成！共生成 ${payload.solutions || 0} 个独立方案`); if (payload.tree) { treeRoot = payload.tree; renderTree(payload.tree); } if (payload.bestCode) { showResult(payload.bestCode); } });
+  eventSource.addEventListener('log', e => { const d = JSON.parse(e.data); addLog('', d.data?.message || ''); });
+  // SSE 断开后尝试通过 REST API 拉取最终树（兜底）
+  eventSource.onerror = () => { fetchFinalTree(); };
+}
+async function startSearch() {
+  const task = document.getElementById('taskInput').value.trim();
+  if (!task) { alert('请输入任务描述'); return; }
+  const cases = testCases.filter(t => t && t.output.trim());
+  const body = { task, testCases: cases };
+  document.getElementById('treePanel').innerHTML = '<div class="empty-state"><div class="icon">⏳</div><div>搜索进行中...</div></div>'; treeRoot = null; latestTreeChildren = 0;
+  document.getElementById('resultSection').classList.remove('show');
+  document.getElementById('logPanel').innerHTML = '';
+  document.getElementById('logCount').textContent = '0';
+  document.getElementById('treeCount').textContent = '';
+  try {
+    const resp = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!resp.ok) { addLog('error', '启动搜索失败: ' + (await resp.text())); document.getElementById('startBtn').disabled = false; return; }
+    saveHistory(task);
+  } catch(e) { addLog('error', '网络错误: ' + e.message); document.getElementById('startBtn').disabled = false; }
+}
+function addLog(cls, msg) {
+  const panel = document.getElementById('logPanel');
+  const empty = panel.querySelector('.empty-state');
+  if (empty) panel.innerHTML = '';
+  const time = new Date().toLocaleTimeString();
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+  entry.innerHTML = `<span class="time">[${time}]</span><span class="msg ${cls}">${escapeHtml(msg)}</span>`;
+  panel.appendChild(entry);
+  panel.scrollTop = panel.scrollHeight;
+  document.getElementById('logCount').textContent = ++logCount;
+}
+function updateStatus(running) { document.getElementById('statusDot').className = 'status-dot ' + (running ? 'running' : ''); }
+function showResult(code) { document.getElementById('codeDisplay').textContent = code; document.getElementById('resultSection').classList.add('show'); }
+function copyCode() { navigator.clipboard.writeText(document.getElementById('codeDisplay').textContent); }
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m])); }
+function truncate(s, maxLen) { if (!s) return ''; return s.length > maxLen ? s.substring(0, maxLen) + '...' : s; }
+function saveHistory(task) {
+  const history = loadHistory().filter(item => item.task !== task);
+  history.unshift({ task, time: Date.now() });
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 20)));
+  renderHistory();
+}
+function loadHistory() { try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return []; } }
+let serverResults = [];
+async function renderHistory() {
+  const list = document.getElementById('historyList');
+  // 拉取服务端保存的结果
+  try {
+    const resp = await fetch('/api/results');
+    if (resp.ok) serverResults = await resp.json();
+  } catch (_) {}
+  const local = loadHistory();
+  const total = local.length + serverResults.length;
+  document.getElementById('historyCount').textContent = total ? `${total}` : '';
+  if (!total) { list.innerHTML = '<div class="history-empty">暂无历史</div>'; return; }
+  let html = '';
+  // 服务端结果（带搜索树和代码）
+  for (const r of serverResults) {
+    html += `<button class="history-item" onclick="loadServerResult('${escapeHtml(r.file)}')">📦 ${escapeHtml(r.task)}<span class="time">${new Date(r.timestamp).toLocaleString()} (${r.solutions||0}方案)</span></button>`;
+  }
+  // 本地历史（仅任务文本）
+  for (const item of local) {
+    const isInServer = serverResults.some(r => r.task === item.task);
+    if (isInServer) continue;
+    html += `<button class="history-item" onclick="reuseHistoryText('${escapeHtml(item.task)}')">📝 ${escapeHtml(item.task)}<span class="time">${new Date(item.time).toLocaleString()}</span></button>`;
+  }
+  list.innerHTML = html;
+}
+async function loadServerResult(file) {
+  try {
+    const resp = await fetch('/api/results/' + encodeURIComponent(file));
+    if (!resp.ok) return;
+    const result = await resp.json();
+    addLog('info', `加载已保存的结果: ${result.task}`);
+    if (result.tree) { treeRoot = result.tree; renderTree(result.tree); }
+    if (result.bestCode) showResult(result.bestCode);
+  } catch(_) {}
+}
+function reuseHistoryText(task) { document.getElementById('taskInput').value = task; }
+function clearHistory() { localStorage.removeItem(HISTORY_KEY); renderHistory(); }
+function renderTree(node) {
+  const panel = document.getElementById('treePanel');
+  if (!node) {
+    panel.innerHTML = '<div class="empty-state"><div class="icon">🌲</div><div>暂无搜索树</div></div>';
+    document.getElementById('treeCount').textContent = '';
+    return;
+  }
+  const html = buildTreeHTML(node);
+  panel.innerHTML = `<div class="tree"><ul>${html}</ul></div>`;
+  updateTreeCount(node);
+}
+
+function buildTreeHTML(node, depth = 0) {
+  if (!node) return '';
+  const avg = node.avg || 0;
+  const scoreClass = avg >= 0.7 ? 'high' : avg >= 0.3 ? 'mid' : 'low';
+  const isRoot = depth === 0;
+  const hasChildren = node.children && node.children.length > 0;
+  const thought = node.thought || '';
+
+  let html = `<li>`;
+  html += `<div class="node ${isRoot ? 'root' : ''}">`;
+  if (hasChildren) {
+    html += `<span class="expand-toggle" onclick="toggleBranch(this)">▼</span>`;
+  } else {
+    html += `<span style="width:16px;display:inline-block"></span>`;
+  }
+  html += `<span class="thought" title="${escapeHtml(thought)}">${escapeHtml(truncate(thought, 60))}</span>`;
+  html += `<span class="score ${scoreClass}">${avg.toFixed(2)}</span>`;
+  html += `</div>`;
+  if (hasChildren) {
+    html += `<ul>`;
+    for (const child of node.children) {
+      html += buildTreeHTML(child, depth + 1);
+    }
+    html += `</ul>`;
+  }
+  html += `</li>`;
+  return html;
+}
+
+function toggleBranch(el) {
+  const ul = el.closest('li').querySelector('ul');
+  if (ul) {
+    ul.style.display = ul.style.display === 'none' ? '' : 'none';
+    el.textContent = ul.style.display === 'none' ? '▶' : '▼';
+  }
+}
+
+function updateTreeCount(node) {
+  function count(n) {
+    let c = 1;
+    if (n.children) for (const ch of n.children) c += count(ch);
+    return c;
+  }
+  document.getElementById('treeCount').textContent = node ? `${count(node)} 节点` : '';
+}
+
+// SSE 断开后轮询 /api/tree 获取最终树（最多尝试 10 次）
+async function fetchFinalTree(retries = 10) {
+  for (let i = 0; i < retries; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    try {
+      const resp = await fetch('/api/tree');
+      if (!resp.ok) continue;
+      const treeData = await resp.json();
+      if (treeData && treeData.thought !== undefined) {
+        treeRoot = treeData;
+        renderTree(treeRoot);
+        searchEnded();
+        return;
+      }
+    } catch (_) {}
+  }
+}
+function searchEnded() {
+  searching = false;
+  updateStatus(false);
+  document.getElementById('startBtn').disabled = false;
+}
+
+async function login() {
+  const username = document.getElementById('username').value.trim();
+  const password = document.getElementById('password').value;
+  const resp = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+  if (!resp.ok) { document.getElementById('loginMsg').textContent = '登录失败'; return; }
+  document.getElementById('loginView').classList.add('hidden');
+  document.getElementById('appView').classList.add('show');
+  connectSSE();
+  renderHistory();
+}
+async function logout() {
+  await fetch('/api/logout', { method: 'POST' });
+  location.reload();
+}
+async function boot() {
+  const resp = await fetch('/api/me');
+  const me = await resp.json();
+  if (me.loggedIn) {
+    document.getElementById('loginView').classList.add('hidden');
+    document.getElementById('appView').classList.add('show');
+    connectSSE();
+    renderHistory();
+  }
+}
+boot();
+</script>
